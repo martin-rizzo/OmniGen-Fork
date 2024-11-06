@@ -49,7 +49,25 @@ class OmniGenPipeline:
         model: OmniGen,
         processor: OmniGenProcessor,
         device: Union[str, torch.device] = None,
+        modify_model_precision: bool = True
     ):
+        """
+        Initializes the OmniGenPipeline.
+        Args:
+            vae (AutoencoderKL):
+                    The VAE to be used for converting RGB <-> latent space.
+            model (OmniGen):
+                    The model to be used for image generation.
+            processor (OmniGenProcessor):
+                    The processor to convert prompts into tokens and combine them with images.
+            device (Union[str, torch.device]):
+                    The device to run the pipeline on. If None, the pipeline will automatically
+                    detect an available device and use it.
+            modify_model_precision (bool):
+                    Whether or not to modify the precision of the model when running the pipeline.
+                    Defaults to True. Be cautious when using this feature as it can affect the
+                    performance and accuracy of the generated images.
+        """
         self.vae = vae
         self.model = model
         self.processor = processor
@@ -64,9 +82,10 @@ class OmniGenPipeline:
                 logger.info("Don't detect any available GPUs, using CPU instead, this may take long time to generate image!!!")
                 self.device = torch.device("cpu")
 
-        self.model.to(torch.bfloat16)
-        self.model.eval()
-        self.vae.eval()
+        if modify_model_precision:
+            self.model.to(torch.bfloat16)
+            self.model.eval()
+            self.vae.eval()
 
         self.model_cpu_offload = False
 
@@ -149,8 +168,9 @@ class OmniGenPipeline:
         use_kv_cache: bool = True,
         offload_kv_cache: bool = True,
         use_input_image_size_as_output: bool = False,
-        dtype: torch.dtype = torch.bfloat16,
         seed: int = None,
+        latent_dtype: torch.dtype = torch.bfloat16,
+        dtype: torch.dtype = None,
         ):
         r"""
         Function invoked when calling the pipeline for generation.
@@ -185,13 +205,18 @@ class OmniGenPipeline:
             use_input_image_size_as_output (bool, defaults to False): whether to use the input image size as the output image size, which can be used for single-image input, e.g., image editing task
             seed (`int`, *optional*):
                 A random seed for generating output. 
-            dtype (`torch.dtype`, *optional*, defaults to `torch.bfloat16`):
-                data type for the model
+            latent_dtype (`torch.dtype`, *optional*, defaults to `torch.bfloat16`):
+                data type for the latents, should be equal or compatible with the dtype of the model.
+            dtype: deprecated
         Examples:
 
         Returns:
             A list with the generated images.
         """
+        assert dtype is None, (
+            "The `dtype` parameter is deprecated as it was altering the type of 'model'."
+            "Please use the `latent_dtype` parameter instead, which provides a more specific and inoffensive approach."
+        )
         # check inputs:
         if use_input_image_size_as_output:
             assert isinstance(prompt, str) and len(input_images) == 1, "if you want to make sure the output image have the same size as the input image, please only input one image instead of multiple input images"
@@ -227,7 +252,7 @@ class OmniGenPipeline:
         else:
             generator = None
         latents = torch.randn(num_prompt, 4, latent_size_h, latent_size_w, device=self.device, generator=generator)
-        latents = torch.cat([latents]*(1+num_cfg), 0).to(dtype)
+        latents = torch.cat([latents]*(1+num_cfg), 0).to(latent_dtype)
 
         if input_images is not None and self.model_cpu_offload: self.vae.to(self.device)
         input_img_latents = []
@@ -235,12 +260,12 @@ class OmniGenPipeline:
             for temp_pixel_values in input_data['input_pixel_values']:
                 temp_input_latents = []
                 for img in temp_pixel_values:
-                    img = self.vae_encode(img.to(self.device), dtype)
+                    img = self.vae_encode(img.to(self.device), latent_dtype)
                     temp_input_latents.append(img)
                 input_img_latents.append(temp_input_latents)
         else:
             for img in input_data['input_pixel_values']:
-                img = self.vae_encode(img.to(self.device), dtype)
+                img = self.vae_encode(img.to(self.device), latent_dtype)
                 input_img_latents.append(img)
         if input_images is not None and self.model_cpu_offload:
             self.vae.to('cpu')
@@ -263,7 +288,7 @@ class OmniGenPipeline:
             func = self.model.forward_with_separate_cfg
         else:
             func = self.model.forward_with_cfg
-        self.model.to(dtype)
+        #self.model.to(model_dtype)
 
         if self.model_cpu_offload:
             for name, param in self.model.named_parameters():
@@ -290,7 +315,9 @@ class OmniGenPipeline:
         if self.vae.config.shift_factor is not None:
             samples = samples / self.vae.config.scaling_factor + self.vae.config.shift_factor
         else:
-            samples = samples / self.vae.config.scaling_factor   
+            samples = samples / self.vae.config.scaling_factor
+
+        samples = samples.to(latent_dtype)
         samples = self.vae.decode(samples).sample
 
         if self.model_cpu_offload:
